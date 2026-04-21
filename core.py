@@ -5,15 +5,13 @@ import base64
 from io import BytesIO
 from pathlib import Path
 import tempfile
-from datetime import datetime
-import uuid
 from difflib import SequenceMatcher
 
 import pandas as pd
+import streamlit as st
 from docx import Document as DocxDocument
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
-from streamlit import session_state as st_state
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import inch
@@ -21,6 +19,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_CENTER
 from reportlab.lib import colors
+
 
 MODEL_PRICING = {
     "gpt-4o-mini": {"input_per_1k": 0.00015, "output_per_1k": 0.0006},
@@ -42,27 +41,58 @@ REQUIRED_RESUME_PLACEHOLDERS = [
     "{{projects}}",
 ]
 
+
+# ------------------------------
+# API KEY / MODEL HELPERS
+# ------------------------------
+def get_openai_api_key() -> str:
+    api_key = (
+        st.secrets.get("OPENAI_API_KEY")
+        or st.secrets.get("openai_api_key")
+        or st.secrets.get("openai", {}).get("api_key")
+        or st.session_state.get("api_key")
+    )
+    if not api_key:
+        raise ValueError("Missing OpenAI API key in Streamlit secrets")
+    return api_key
+
+
+def get_selected_model() -> str:
+    return st.session_state.get("model_choice", "gpt-4o-mini")
+
+
+def build_llm(model_name: str | None = None) -> ChatOpenAI:
+    model_name = model_name or get_selected_model()
+    return ChatOpenAI(
+        model=model_name,
+        temperature=0,
+        api_key=get_openai_api_key(),
+        timeout=90,
+        max_retries=1,
+    )
+
+
 # ------------------------------
 # METRICS
 # ------------------------------
 def ensure_metrics_state():
-    if "metrics" not in st_state:
-        st_state["metrics"] = {
+    if "metrics" not in st.session_state:
+        st.session_state["metrics"] = {
             "tokens": 0,
             "input_tokens": 0,
             "output_tokens": 0,
             "cost": 0.0,
             "response_times": [],
-            "calls": 0
+            "calls": 0,
         }
 
-    if "doc_costs" not in st_state:
-        st_state["doc_costs"] = {}
+    if "doc_costs" not in st.session_state:
+        st.session_state["doc_costs"] = {}
 
 
 def get_current_metrics_snapshot():
     ensure_metrics_state()
-    m = st_state["metrics"]
+    m = st.session_state["metrics"]
     return {
         "tokens": m.get("tokens", 0),
         "input_tokens": m.get("input_tokens", 0),
@@ -83,22 +113,12 @@ def diff_metrics_snapshot(before, after):
 
 
 def get_model_pricing(model_name: str):
-    return MODEL_PRICING.get(model_name, MODEL_PRICING.get("gpt-4o-mini"))
+    return MODEL_PRICING.get(model_name, MODEL_PRICING["gpt-4o-mini"])
 
 
 def invoke_llm_tracked(prompt: str):
-    if "api_key" not in st_state:
-        raise ValueError("Missing API key")
-
-    model_name = st_state.get("model_choice", "gpt-4o-mini")
-    
-    llm = ChatOpenAI(
-    model=model_name,
-    temperature=0,
-    api_key=st_state["api_key"],
-    timeout=90,
-    max_retries=1,
-    )
+    model_name = get_selected_model()
+    llm = build_llm(model_name)
 
     start = time.time()
     response = llm.invoke(prompt)
@@ -109,8 +129,8 @@ def invoke_llm_tracked(prompt: str):
     output_tokens = usage.get("completion_tokens", 0)
 
     if not input_tokens and not output_tokens:
-        input_tokens = len(str(prompt)) // 4
-        output_tokens = len(str(getattr(response, "content", ""))) // 4
+        input_tokens = max(1, len(str(prompt)) // 4)
+        output_tokens = max(1, len(str(getattr(response, "content", ""))) // 4)
 
     total_tokens = input_tokens + output_tokens
     pricing = get_model_pricing(model_name)
@@ -119,7 +139,7 @@ def invoke_llm_tracked(prompt: str):
     total_cost = input_cost + output_cost
 
     ensure_metrics_state()
-    m = st_state["metrics"]
+    m = st.session_state["metrics"]
     m["tokens"] += total_tokens
     m["input_tokens"] += input_tokens
     m["output_tokens"] += output_tokens
@@ -127,14 +147,15 @@ def invoke_llm_tracked(prompt: str):
     m["calls"] += 1
     m["response_times"].append(duration)
 
-    doc = st_state.get("current_file") or "unknown"
-    if doc not in st_state["doc_costs"]:
-        st_state["doc_costs"][doc] = {"cost": 0.0, "tokens": 0}
+    doc_name = st.session_state.get("current_file") or "unknown"
+    if doc_name not in st.session_state["doc_costs"]:
+        st.session_state["doc_costs"][doc_name] = {"cost": 0.0, "tokens": 0}
 
-    st_state["doc_costs"][doc]["cost"] += total_cost
-    st_state["doc_costs"][doc]["tokens"] += total_tokens
+    st.session_state["doc_costs"][doc_name]["cost"] += total_cost
+    st.session_state["doc_costs"][doc_name]["tokens"] += total_tokens
 
     return response
+
 
 # ------------------------------
 # OCR / EXTRACTION QUALITY
@@ -159,18 +180,8 @@ def needs_ocr_fallback(text: str, min_chars: int = 120) -> bool:
 
 
 def ocr_image_bytes_with_vlm(image_bytes: bytes, mime_type: str = "image/png") -> str:
-    if "api_key" not in st_state:
-        raise ValueError("Missing API key")
-
-    model_name = st_state.get("model_choice", "gpt-4o-mini")
-
-    llm = ChatOpenAI(
-    model=model_name,
-    temperature=0,
-    api_key=st_state["api_key"],
-    timeout=90,
-    max_retries=1,
-    )
+    model_name = get_selected_model()
+    llm = build_llm(model_name)
 
     encoded = base64.b64encode(image_bytes).decode()
     msg = HumanMessage(
@@ -181,14 +192,14 @@ def ocr_image_bytes_with_vlm(image_bytes: bytes, mime_type: str = "image/png") -
 
 Rules:
 - Output plain text only
-- Preserve numbers, dates, amounts, and layout as much as possible
+- Preserve numbers, dates, names, headings, and layout as much as possible
 - Do not summarize
-"""
+""",
             },
             {
                 "type": "image_url",
-                "image_url": {"url": f"data:{mime_type};base64,{encoded}"}
-            }
+                "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
+            },
         ]
     )
 
@@ -197,10 +208,10 @@ Rules:
     duration = time.time() - start
 
     ensure_metrics_state()
-    m = st_state["metrics"]
+    m = st.session_state["metrics"]
     content = getattr(response, "content", "") or ""
     input_tokens = 250
-    output_tokens = len(str(content)) // 4
+    output_tokens = max(1, len(str(content)) // 4)
     pricing = get_model_pricing(model_name)
     total_cost = (input_tokens * pricing["input_per_1k"] / 1000) + (output_tokens * pricing["output_per_1k"] / 1000)
 
@@ -211,11 +222,11 @@ Rules:
     m["calls"] += 1
     m["response_times"].append(duration)
 
-    doc = st_state.get("current_file") or "unknown"
-    if doc not in st_state["doc_costs"]:
-        st_state["doc_costs"][doc] = {"cost": 0.0, "tokens": 0}
-    st_state["doc_costs"][doc]["cost"] += total_cost
-    st_state["doc_costs"][doc]["tokens"] += input_tokens + output_tokens
+    doc_name = st.session_state.get("current_file") or "unknown"
+    if doc_name not in st.session_state["doc_costs"]:
+        st.session_state["doc_costs"][doc_name] = {"cost": 0.0, "tokens": 0}
+    st.session_state["doc_costs"][doc_name]["cost"] += total_cost
+    st.session_state["doc_costs"][doc_name]["tokens"] += input_tokens + output_tokens
 
     return str(content).strip()
 
@@ -280,6 +291,7 @@ def extract_text_from_pdf_with_ocr_fallback(file_path: str):
             "exception_reason": f"OCR fallback failed: {str(e)}",
         }
 
+
 # ------------------------------
 # JSON / EXTRACTION
 # ------------------------------
@@ -310,65 +322,14 @@ def safe_json_parse(text):
 
     return {"raw_output": text}
 
-def compact_whitespace(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
 
-
-def trim_text_for_doc_type(text: str, doc_type: str) -> str:
-    text = text or ""
-
-    if doc_type == "resume":
-        return text[:8000]
-
-    if doc_type == "invoice":
-        keywords = [
-            "invoice", "vendor", "supplier", "bill to", "invoice number",
-            "invoice no", "date", "due date", "total", "tax", "subtotal",
-            "purchase order"
-        ]
-        lowered = text.lower()
-        snippets = []
-
-        for kw in keywords:
-            idx = lowered.find(kw)
-            if idx != -1:
-                start = max(0, idx - 250)
-                end = min(len(text), idx + 700)
-                snippets.append(text[start:end])
-
-        if snippets:
-            merged = "\n".join(snippets)
-            return merged[:5000]
-
-        return text[:5000]
-
-    if doc_type == "ticket":
-        keywords = [
-            "traveler", "passenger", "ticket", "booking", "pnr", "airline",
-            "departure", "arrival", "from", "to", "flight", "amount", "date"
-        ]
-        lowered = text.lower()
-        snippets = []
-
-        for kw in keywords:
-            idx = lowered.find(kw)
-            if idx != -1:
-                start = max(0, idx - 250)
-                end = min(len(text), idx + 700)
-                snippets.append(text[start:end])
-
-        if snippets:
-            merged = "\n".join(snippets)
-            return merged[:5000]
-
-        return text[:5000]
-
-    return text[:4000]
+def trim_text_for_resume(text: str) -> str:
+    return (text or "")[:12000]
 
 
 def guess_resume_name(text: str) -> str:
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    for line in lines[:5]:
+    for line in lines[:8]:
         if "@" in line:
             continue
         if len(line.split()) in [2, 3, 4] and len(line) < 60:
@@ -376,17 +337,18 @@ def guess_resume_name(text: str) -> str:
                 return line.strip()
     return ""
 
+
 def extract_structured_json(text, doc_type):
-    clean_text = re.sub(r"[^\x00-\x7F]+", " ", text or "")
-    clean_text = clean_text.replace("{", "").replace("}", "").strip()
-    clean_text = trim_text_for_doc_type(clean_text, doc_type)
+    if doc_type != "resume":
+        return {}
 
-    if "api_key" not in st_state:
-        return {"error": "Missing API key"}
+    clean_text = re.sub(r"[^\x00-\x7F]+", " ", text or "").strip()
+    clean_text = trim_text_for_resume(clean_text)
 
-    if doc_type == "resume":
-        prompt = f"""
-Return ONLY valid JSON matching this schema:
+    prompt = f"""
+Extract resume data and return ONLY valid JSON.
+
+Schema:
 {{
   "name": "",
   "email": "",
@@ -438,44 +400,16 @@ Return ONLY valid JSON matching this schema:
 }}
 
 Rules:
+- Resume/CV only
 - No markdown
 - No explanation
-- Preserve dates exactly
+- Preserve names, employers, skills, dates, links, and contact details exactly when present
 - Use empty strings or empty arrays when missing
+- Do not invent experience or education
 
 CV TEXT:
 {clean_text}
 """
-    elif doc_type == "invoice":
-        prompt = f"""
-Return ONLY valid JSON.
-
-Extract:
-vendor, supplier, invoice_number, invoice_no, invoice_date, due_date,
-currency, subtotal, tax, total, purchase_order, line_items
-
-No markdown.
-No explanation.
-
-DOCUMENT TEXT:
-{clean_text}
-"""
-    elif doc_type == "ticket":
-        prompt = f"""
-Return ONLY valid JSON.
-
-Extract:
-traveler_name, ticket_number, booking_reference, airline, from, to,
-departure_date, return_date, amount, currency, class, trip_type
-
-No markdown.
-No explanation.
-
-DOCUMENT TEXT:
-{clean_text}
-"""
-    else:
-        return {}
 
     try:
         response = invoke_llm_tracked(prompt).content.strip()
@@ -492,27 +426,27 @@ DOCUMENT TEXT:
         if not isinstance(parsed, dict):
             parsed = {"data": parsed}
 
-        if doc_type == "resume":
-            guessed_name = guess_resume_name(clean_text)
-            if not parsed.get("name") and guessed_name:
-                parsed["name"] = guessed_name
+        guessed_name = guess_resume_name(clean_text)
+        if not parsed.get("name") and guessed_name:
+            parsed["name"] = guessed_name
 
-            if not parsed.get("name"):
-                parsed["name"] = "Candidate"
+        if not parsed.get("name"):
+            parsed["name"] = "Candidate"
 
-            for field in ["name", "email", "phone", "location", "linkedin", "summary"]:
-                parsed[field] = str(parsed.get(field, "") or "")
+        for field in ["name", "email", "phone", "location", "linkedin", "summary"]:
+            parsed[field] = str(parsed.get(field, "") or "")
 
-            parsed["skills"] = parsed.get("skills", []) if isinstance(parsed.get("skills", []), list) else []
-            parsed["education"] = parsed.get("education", []) if isinstance(parsed.get("education", []), list) else []
-            parsed["experience"] = parsed.get("experience", []) if isinstance(parsed.get("experience", []), list) else []
-            parsed["certifications"] = parsed.get("certifications", []) if isinstance(parsed.get("certifications", []), list) else []
-            parsed["projects"] = parsed.get("projects", []) if isinstance(parsed.get("projects", []), list) else []
+        parsed["skills"] = parsed.get("skills", []) if isinstance(parsed.get("skills"), list) else []
+        parsed["education"] = parsed.get("education", []) if isinstance(parsed.get("education"), list) else []
+        parsed["experience"] = parsed.get("experience", []) if isinstance(parsed.get("experience"), list) else []
+        parsed["certifications"] = parsed.get("certifications", []) if isinstance(parsed.get("certifications"), list) else []
+        parsed["projects"] = parsed.get("projects", []) if isinstance(parsed.get("projects"), list) else []
 
         return parsed
 
     except Exception as e:
         return {"error": "LLM request failed", "details": str(e)[:300]}
+
 
 # ------------------------------
 # CONFIDENCE + VALIDATION
@@ -526,7 +460,7 @@ def confidence_label(score):
 
 
 def build_confidence_map(data, doc_type):
-    if not isinstance(data, dict):
+    if doc_type != "resume" or not isinstance(data, dict):
         return {}
 
     def score_scalar(value, strong=False):
@@ -541,63 +475,34 @@ def build_confidence_map(data, doc_type):
         return {"score": score, "label": confidence_label(score), "reason": reason}
 
     confidence = {}
+    for field in ["name", "email", "phone", "location", "summary"]:
+        confidence[field] = score_scalar(data.get(field), strong=field in ["name", "email"])
 
-    if doc_type == "invoice":
-        for field in ["vendor", "invoice_number", "invoice_date", "total", "currency", "due_date"]:
-            val = data.get(field) or data.get(field.replace("invoice_number", "invoice_no"))
-            confidence[field] = score_scalar(val, strong=field in ["invoice_number", "total"])
-
-    elif doc_type == "ticket":
-        for field in ["traveler_name", "ticket_number", "airline", "from", "to", "departure_date", "amount"]:
-            confidence[field] = score_scalar(data.get(field), strong=field in ["ticket_number", "departure_date"])
-
-    elif doc_type == "resume":
-        for field in ["name", "email", "phone", "location", "summary"]:
-            confidence[field] = score_scalar(data.get(field), strong=field in ["name", "email"])
-        confidence["experience"] = score_scalar(data.get("experience"), strong=True)
-        confidence["education"] = score_scalar(data.get("education"), strong=True)
+    confidence["experience"] = score_scalar(data.get("experience"), strong=True)
+    confidence["education"] = score_scalar(data.get("education"), strong=True)
+    confidence["skills"] = score_scalar(data.get("skills"), strong=True)
 
     return confidence
 
 
 def validate_document_data(data, doc_type):
+    if doc_type != "resume":
+        return {"passed": False, "issues": ["Unsupported document type"], "warnings": []}
+
     issues = []
     warnings = []
 
     if not isinstance(data, dict):
         return {"passed": False, "issues": ["No structured data available"], "warnings": []}
 
-    if doc_type == "invoice":
-        if not (data.get("vendor") or data.get("supplier")):
-            issues.append("Vendor is missing")
-        if not (data.get("invoice_number") or data.get("invoice_no")):
-            issues.append("Invoice number is missing")
-        if not data.get("invoice_date"):
-            issues.append("Invoice date is missing")
-        if not data.get("total"):
-            issues.append("Total amount is missing")
-
-    elif doc_type == "ticket":
-        if not data.get("traveler_name"):
-            issues.append("Traveler name is missing")
-        if not data.get("ticket_number"):
-            issues.append("Ticket number is missing")
-        if not data.get("from") or not data.get("to"):
-            issues.append("Route is incomplete")
-        if not data.get("departure_date"):
-            issues.append("Departure date is missing")
-        if not data.get("amount"):
-            warnings.append("Amount is missing")
-
-    elif doc_type == "resume":
-        if not data.get("name"):
-            issues.append("Candidate name is missing")
-        if not data.get("experience"):
-            issues.append("Experience section is missing")
-        if not data.get("education"):
-            warnings.append("Education section is missing")
-        if not data.get("skills"):
-            warnings.append("Skills section is missing")
+    if not data.get("name"):
+        issues.append("Candidate name is missing")
+    if not data.get("experience"):
+        issues.append("Experience section is missing")
+    if not data.get("education"):
+        warnings.append("Education section is missing")
+    if not data.get("skills"):
+        warnings.append("Skills section is missing")
 
     return {"passed": len(issues) == 0, "issues": issues, "warnings": warnings}
 
@@ -606,6 +511,9 @@ def classify_exception(doc_type, text, validation, confidence, extraction_meta):
     if extraction_meta.get("exception_reason"):
         return extraction_meta["exception_reason"]
 
+    if doc_type != "resume":
+        return f"Not a CV/Resume (detected: {doc_type or 'other'})"
+
     if needs_ocr_fallback(text):
         return "No extractable text"
 
@@ -613,10 +521,11 @@ def classify_exception(doc_type, text, validation, confidence, extraction_meta):
         return "Validation failed"
 
     low_conf = [k for k, v in (confidence or {}).items() if v.get("label") == "Low"]
-    if len(low_conf) >= 2:
+    if len(low_conf) >= 3:
         return "Low confidence"
 
     return None
+
 
 # ------------------------------
 # TEMPLATE MANAGER
@@ -677,13 +586,11 @@ def validate_resume_template(template_file):
         "required_placeholders": REQUIRED_RESUME_PLACEHOLDERS,
     }
 
+
 # ------------------------------
 # RESUME
 # ------------------------------
 def generate_resume_summary(data):
-    if "api_key" not in st_state:
-        return "Summary not available"
-
     prompt = f"""
 Create a professional resume summary in plain text.
 
@@ -862,6 +769,7 @@ def build_resume(data, template_file):
     doc.save(buffer)
     return buffer.getvalue()
 
+
 # ------------------------------
 # DUPLICATE DETECTION
 # ------------------------------
@@ -882,30 +790,13 @@ def similarity_score(a, b):
 
 
 def generate_duplicate_key(doc_type, data):
-    if not isinstance(data, dict):
+    if doc_type != "resume" or not isinstance(data, dict):
         return None
 
-    if doc_type == "invoice":
-        vendor = data.get("vendor") or data.get("supplier") or ""
-        invoice_no = data.get("invoice_number") or data.get("invoice_no") or ""
-        total = data.get("total") or ""
-        invoice_date = data.get("invoice_date") or ""
-        return f"invoice|{normalize_text_for_match(vendor)}|{normalize_text_for_match(invoice_no)}|{normalize_text_for_match(total)}|{normalize_text_for_match(invoice_date)}"
-
-    if doc_type == "ticket":
-        traveler = data.get("traveler_name") or ""
-        ticket_no = data.get("ticket_number") or ""
-        route = f"{data.get('from', '')}-{data.get('to', '')}"
-        departure_date = data.get("departure_date") or ""
-        return f"ticket|{normalize_text_for_match(traveler)}|{normalize_text_for_match(ticket_no)}|{normalize_text_for_match(route)}|{normalize_text_for_match(departure_date)}"
-
-    if doc_type == "resume":
-        name = data.get("name") or ""
-        email = data.get("email") or ""
-        phone = data.get("phone") or ""
-        return f"resume|{normalize_text_for_match(name)}|{normalize_text_for_match(email)}|{normalize_text_for_match(phone)}"
-
-    return None
+    name = data.get("name") or ""
+    email = data.get("email") or ""
+    phone = data.get("phone") or ""
+    return f"resume|{normalize_text_for_match(name)}|{normalize_text_for_match(email)}|{normalize_text_for_match(phone)}"
 
 
 def detect_duplicate_document(new_doc_type, new_data, existing_results):
@@ -952,6 +843,7 @@ def detect_duplicate_document(new_doc_type, new_data, existing_results):
         "score": 0.0,
     }
 
+
 # ------------------------------
 # JD RANKING
 # ------------------------------
@@ -967,7 +859,7 @@ def score_resume_against_jd(resume_data, jd_text):
             "missing_skills": [],
             "strengths": [],
             "gaps": ["Insufficient input"],
-            "recommendation": "Weak Fit"
+            "recommendation": "Weak Fit",
         }
 
     prompt = f"""
@@ -1018,10 +910,10 @@ RESUME DATA:
         parsed["skills_score"] = int(parsed.get("skills_score", 0) or 0)
         parsed["experience_score"] = int(parsed.get("experience_score", 0) or 0)
         parsed["education_score"] = int(parsed.get("education_score", 0) or 0)
-        parsed["matched_skills"] = parsed.get("matched_skills", []) if isinstance(parsed.get("matched_skills", []), list) else []
-        parsed["missing_skills"] = parsed.get("missing_skills", []) if isinstance(parsed.get("missing_skills", []), list) else []
-        parsed["strengths"] = parsed.get("strengths", []) if isinstance(parsed.get("strengths", []), list) else []
-        parsed["gaps"] = parsed.get("gaps", []) if isinstance(parsed.get("gaps", []), list) else []
+        parsed["matched_skills"] = parsed.get("matched_skills", []) if isinstance(parsed.get("matched_skills"), list) else []
+        parsed["missing_skills"] = parsed.get("missing_skills", []) if isinstance(parsed.get("missing_skills"), list) else []
+        parsed["strengths"] = parsed.get("strengths", []) if isinstance(parsed.get("strengths"), list) else []
+        parsed["gaps"] = parsed.get("gaps", []) if isinstance(parsed.get("gaps"), list) else []
         parsed["recommendation"] = str(parsed.get("recommendation") or "Moderate Fit")
 
         parsed["overall_score"] = max(0, min(100, parsed["overall_score"]))
@@ -1042,54 +934,9 @@ RESUME DATA:
             "missing_skills": [],
             "strengths": [],
             "gaps": ["Scoring failed"],
-            "recommendation": "Weak Fit"
+            "recommendation": "Weak Fit",
         }
 
-# ------------------------------
-# CONCUR MOCK
-# ------------------------------
-def send_to_concur(doc_type, data, mode="mock"):
-    payload = {"type": doc_type, "data": data}
-
-    if doc_type == "invoice":
-        try:
-            payload["line_items"] = json_to_kv_dataframe(data).to_dict(orient="records")
-        except Exception:
-            payload["line_items"] = []
-
-    now_utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    short_id = uuid.uuid4().hex[:8].upper()
-    batch_id = f"CCB-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
-    endpoint = "Expense Entry Import API" if doc_type == "invoice" else "Travel Request / Expense Entry API"
-
-    if mode == "mock":
-        return {
-            "status": "submitted",
-            "mode": "mock",
-            "message": f"{doc_type.title()} submitted to Concur mock gateway",
-            "submission_id": f"SUB-{short_id}",
-            "batch_id": batch_id,
-            "document_id": f"{doc_type[:3].upper()}-{uuid.uuid4().hex[:10].upper()}",
-            "submitted_at": now_utc,
-            "endpoint": endpoint,
-            "processing_state": "Queued for downstream validation",
-            "next_status": "Expected to transition to Accepted or Rejected after validation",
-            "payload": payload
-        }
-
-    return {
-        "status": "submitted",
-        "mode": "real",
-        "message": f"{doc_type.title()} submitted to Concur",
-        "submission_id": f"SUB-{short_id}",
-        "batch_id": batch_id,
-        "document_id": f"{doc_type[:3].upper()}-{uuid.uuid4().hex[:10].upper()}",
-        "submitted_at": now_utc,
-        "endpoint": endpoint,
-        "processing_state": "Accepted by Concur endpoint",
-        "next_status": "Awaiting downstream processing",
-        "payload": payload
-    }
 
 # ------------------------------
 # MISC
@@ -1102,63 +949,65 @@ def save_temp_file(uploaded_file):
 
 
 def detect_document_type(text):
-    if "api_key" not in st_state:
+    text = (text or "").strip()
+
+    if not text:
         return "other"
 
+    # Fast heuristic layer first
+    lower = text.lower()
+
+    resume_signals = 0
+    resume_patterns = [
+        r"\bresume\b",
+        r"\bcurriculum vitae\b",
+        r"\bcv\b",
+        r"\bexperience\b",
+        r"\beducation\b",
+        r"\bskills\b",
+        r"\bemployment\b",
+        r"\bprofessional summary\b",
+        r"\bwork history\b",
+        r"\blinkedin\b",
+    ]
+    for pattern in resume_patterns:
+        if re.search(pattern, lower):
+            resume_signals += 1
+
+    if re.search(r"@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text):
+        resume_signals += 1
+    if re.search(r"\+?\d[\d\s().-]{7,}\d", text):
+        resume_signals += 1
+
+    if resume_signals >= 2:
+        return "resume"
+
+    # LLM fallback for ambiguous documents
     prompt = f"""
-Classify document into ONE label:
+Classify the document into exactly one label:
 
 resume
-invoice
-receipt
-report
-ticket
 other
 
-Return only the label.
+Rules:
+- Return only one word
+- Choose resume only if it is clearly a person's resume/CV/profile
+- Otherwise return other
 
-{text[:2000]}
+DOCUMENT TEXT:
+{text[:4000]}
 """
     try:
         raw = invoke_llm_tracked(prompt).content.lower().strip()
     except Exception:
         return "other"
 
-    labels = ["resume", "invoice", "receipt", "report", "ticket", "other"]
-    for label in labels:
-        if label == raw:
-            return label
-    for label in labels:
-        if label in raw:
-            return label
+    if raw == "resume":
+        return "resume"
+    if "resume" in raw:
+        return "resume"
     return "other"
 
-
-def json_to_kv_dataframe(data):
-    rows = []
-
-    def flatten(prefix, obj):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                flatten(f"{prefix}.{k}" if prefix else k, v)
-        elif isinstance(obj, list):
-            for i, item in enumerate(obj):
-                flatten(f"{prefix}[{i}]", item)
-        else:
-            rows.append({
-                "Field": prefix,
-                "Value": json.dumps(obj) if isinstance(obj, (dict, list)) else str(obj)
-            })
-
-    flatten("", data if data is not None else {})
-    return pd.DataFrame(rows)
-
-
-def generate_excel(df):
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="data")
-    return output.getvalue()
 
 def _safe_list(value):
     return value if isinstance(value, list) else []
@@ -1175,12 +1024,12 @@ def generate_recruiter_questions_from_jd(jd_text: str):
         return [
             {
                 "question": "Can you walk us through your most recent relevant project?",
-                "expected_answer": "Candidate should clearly explain ownership, stack, outcomes, and delivery impact."
+                "expected_answer": "Candidate should clearly explain ownership, stack, outcomes, and delivery impact.",
             },
             {
                 "question": "Are you comfortable with hybrid work expectations and role-specific shift needs?",
-                "expected_answer": "Candidate should confirm location, shift flexibility, and return-to-office readiness."
-            }
+                "expected_answer": "Candidate should confirm location, shift flexibility, and return-to-office readiness.",
+            },
         ]
 
     prompt = f"""
@@ -1220,7 +1069,7 @@ JOB DESCRIPTION:
                 if question:
                     clean_questions.append({
                         "question": question,
-                        "expected_answer": expected or "-"
+                        "expected_answer": expected or "-",
                     })
 
         if clean_questions:
@@ -1231,16 +1080,16 @@ JOB DESCRIPTION:
     return [
         {
             "question": "Can you explain your most recent role and your exact delivery responsibilities?",
-            "expected_answer": "Candidate should clearly describe scope, role ownership, technology environment, and measurable outcomes."
+            "expected_answer": "Candidate should clearly describe scope, role ownership, technology environment, and measurable outcomes.",
         },
         {
             "question": "How closely does your experience align with this JD’s mandatory stack and domain expectations?",
-            "expected_answer": "Candidate should map prior work to the required stack and honestly clarify any missing domain exposure."
+            "expected_answer": "Candidate should map prior work to the required stack and honestly clarify any missing domain exposure.",
         },
         {
             "question": "Are you currently available for the required location/work model and notice period expectations?",
-            "expected_answer": "Candidate should confirm current location, hybrid readiness, shift flexibility, and notice details."
-        }
+            "expected_answer": "Candidate should confirm current location, hybrid readiness, shift flexibility, and notice details.",
+        },
     ]
 
 
@@ -1332,7 +1181,7 @@ def generate_consolidated_assessment_data(batch_results, jd_text, jd_rankings):
         candidate_summary = summarize_candidate_for_assessment(
             resume_data=resume_data,
             ranking_data=ranking_data,
-            file_name=file_name
+            file_name=file_name,
         )
         candidates.append(candidate_summary)
 
@@ -1359,13 +1208,10 @@ def generate_consolidated_assessment_data(batch_results, jd_text, jd_rankings):
     return {
         "title": "DetailedAssesment",
         "executive_summary": {
-            "analysis_date": datetime.now().strftime("%B %d, %Y"),
+            "analysis_date": time.strftime("%B %d, %Y"),
             "total_candidates": len(candidates),
             "top_match_range": f"{highest_score} → {lowest_score}" if candidates else "N/A",
-            "recommended_action": (
-                f"{len(primary)} primary / {len(backup)} backup"
-                if candidates else "No recommendation"
-            ),
+            "recommended_action": f"{len(primary)} primary / {len(backup)} backup" if candidates else "No recommendation",
             "jd_summary": jd_text[:1800] if jd_text else "No JD provided",
             "executive_takeaway": takeaway,
         },
@@ -1402,7 +1248,7 @@ def build_consolidated_assessment_pdf(report_data):
         rightMargin=36,
         leftMargin=36,
         topMargin=36,
-        bottomMargin=36
+        bottomMargin=36,
     )
 
     styles = getSampleStyleSheet()
@@ -1414,7 +1260,7 @@ def build_consolidated_assessment_pdf(report_data):
         leading=22,
         textColor=colors.HexColor("#1f1f1f"),
         spaceAfter=10,
-        alignment=TA_LEFT
+        alignment=TA_LEFT,
     )
     section_style = ParagraphStyle(
         "SectionTitle",
@@ -1424,7 +1270,7 @@ def build_consolidated_assessment_pdf(report_data):
         textColor=colors.HexColor("#1f1f1f"),
         spaceBefore=10,
         spaceAfter=8,
-        alignment=TA_LEFT
+        alignment=TA_LEFT,
     )
     body_style = ParagraphStyle(
         "BodySmall",
@@ -1432,12 +1278,12 @@ def build_consolidated_assessment_pdf(report_data):
         fontSize=9.5,
         leading=13,
         textColor=colors.HexColor("#333333"),
-        alignment=TA_LEFT
+        alignment=TA_LEFT,
     )
     small_center = ParagraphStyle(
         "SmallCenter",
         parent=body_style,
-        alignment=TA_CENTER
+        alignment=TA_CENTER,
     )
 
     story = []
@@ -1447,7 +1293,6 @@ def build_consolidated_assessment_pdf(report_data):
     story.append(Paragraph("Confidential • Internal Recruiter Use Only", body_style))
     story.append(Spacer(1, 0.15 * inch))
 
-    # Score cards
     card_data = [[
         Paragraph(f"<b>Candidates Evaluated</b><br/>{executive.get('total_candidates', 0)}", small_center),
         Paragraph(f"<b>Top-Match Range</b><br/>{executive.get('top_match_range', '-')}", small_center),
@@ -1509,7 +1354,7 @@ def build_consolidated_assessment_pdf(report_data):
         score_box = Table([[
             Paragraph(
                 f"<font color='white'><b>Overall Score</b><br/>{c.get('overall_score', 0)}</font>",
-                small_center
+                small_center,
             )
         ]], colWidths=[1.2 * inch], rowHeights=[0.65 * inch])
         score_box.setStyle(TableStyle([
@@ -1524,7 +1369,7 @@ def build_consolidated_assessment_pdf(report_data):
                 f"<b>Current Role:</b> {c.get('current_role', '-') or '-'}<br/>"
                 f"<b>Location:</b> {c.get('location', '-') or '-'}<br/>"
                 f"<b>Recommendation:</b> {c.get('recommendation', '-')}",
-                body_style
+                body_style,
             )
         ]], colWidths=[4.8 * inch])
         info_box.setStyle(TableStyle([
@@ -1585,7 +1430,7 @@ def build_consolidated_assessment_pdf(report_data):
             f"Experience Entries: {c.get('experience_count', 0)}<br/>"
             f"Education Entries: {c.get('education_count', 0)}<br/>"
             f"Certifications: {c.get('certification_count', 0)}",
-            body_style
+            body_style,
         ))
 
     story.append(PageBreak())
