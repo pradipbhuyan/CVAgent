@@ -1206,7 +1206,7 @@ def generate_consolidated_assessment_data(batch_results, jd_text, jd_rankings):
     recruiter_questions = generate_recruiter_questions_from_jd(jd_text)
 
     return {
-        "title": "DetailedAssesment",
+        "title": "DetailedAssesment - NTT DATA TMT Team",
         "executive_summary": {
             "analysis_date": time.strftime("%B %d, %Y"),
             "total_candidates": len(candidates),
@@ -1288,7 +1288,8 @@ def build_consolidated_assessment_pdf(report_data):
 
     story = []
 
-    story.append(Paragraph("Enhanced Candidate Screening Report for NTT Data India TMT Team", title_style))
+    story.append(Paragraph("Enhanced Candidate Screening Report", title_style))
+    story.append(Paragraph("Prepared for NTT DATA TMT Team", body_style))
     story.append(Paragraph(f"Analysis Date: {executive.get('analysis_date', '-')}", body_style))
     story.append(Paragraph("Confidential • Internal Recruiter Use Only", body_style))
     story.append(Spacer(1, 0.15 * inch))
