@@ -1,6 +1,6 @@
 # ==============================
 # INTELLIGENT Resume PROCESSOR
-# SP+One Drive + JD RANKING + Detailed Assessemnt
+# CV Processing Only
 # Revised: Login/API input removed, OpenAI API key loaded from Streamlit secrets
 # ==============================
 
@@ -13,7 +13,6 @@ from io import BytesIO
 from pathlib import Path
 from copy import deepcopy
 import textwrap
-import json
 
 import pandas as pd
 import streamlit as st
@@ -27,17 +26,9 @@ from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
 
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_LEFT, TA_CENTER
-from reportlab.lib import colors
-
 from workflow import build_graph
 from core import (
     build_resume,
-    send_to_concur,
     validate_document_data,
     build_confidence_map,
     classify_exception,
@@ -80,7 +71,6 @@ class RemoteUploadedFile:
 st.set_page_config(page_title="IDP - Professional", layout="wide")
 MAX_BATCH_FILES = 15
 
-# Load API key from Streamlit secrets
 OPENAI_API_KEY = (
     st.secrets.get("OPENAI_API_KEY")
     or st.secrets.get("openai_api_key")
@@ -89,8 +79,7 @@ OPENAI_API_KEY = (
 
 if not OPENAI_API_KEY:
     st.error(
-        "OpenAI API key is missing in Streamlit secrets. "
-        "Please add one of the following:\n\n"
+        "OpenAI API key is missing in Streamlit secrets. Add one of these:\n\n"
         "- OPENAI_API_KEY = 'your-key'\n"
         "- openai_api_key = 'your-key'\n"
         "- [openai]\n  api_key = 'your-key'"
@@ -102,7 +91,7 @@ if not OPENAI_API_KEY:
 # CACHED MODELS
 # ------------------------------
 @st.cache_resource
-def get_llm(model):
+def get_llm(model: str):
     return ChatOpenAI(model=model, temperature=0, api_key=OPENAI_API_KEY)
 
 
@@ -122,7 +111,7 @@ DEFAULT_KEYS = {
         "output_tokens": 0,
         "cost": 0.0,
         "response_times": [],
-        "calls": 0
+        "calls": 0,
     },
     "doc_costs": {},
     "batch_results": [],
@@ -172,8 +161,6 @@ DEFAULT_KEYS = {
     "jd_rankings": [],
     "detailed_assessment_data": None,
     "detailed_assessment_pdf": None,
-    "open_doc_chat": False,
-    "generic_doc_chat_history": [],
 }
 for key, value in DEFAULT_KEYS.items():
     if key not in st.session_state:
@@ -247,8 +234,6 @@ def reset_run_state():
     st.session_state["duplicate_info"] = None
     st.session_state["agent_timings"] = {}
     st.session_state["active_agent"] = None
-    st.session_state["open_doc_chat"] = False
-    st.session_state["generic_doc_chat_history"] = []
 
 
 def reset_single_file_state():
@@ -270,8 +255,6 @@ def reset_single_file_state():
     st.session_state["progress_value"] = 0
     st.session_state["agent_timings"] = {}
     st.session_state["active_agent"] = None
-    st.session_state["open_doc_chat"] = False
-    st.session_state["generic_doc_chat_history"] = []
 
 
 def save_temp_file(uploaded_file):
@@ -479,11 +462,6 @@ def create_vectorstore(docs):
         return None
 
 
-def push_agent_log(message):
-    st.session_state.agent_logs.append(message)
-    refresh_live_batch_activity()
-
-
 def record_agent_event(step, status, message=""):
     now = time.time()
 
@@ -619,7 +597,6 @@ def render_agent_pipeline():
     if pipeline_placeholder is None:
         return
 
-    doc_type = st.session_state.get("doc_type")
     events = st.session_state.get("agent_events", [])
     timings = st.session_state.get("agent_timings", {})
     active_agent = st.session_state.get("active_agent")
@@ -633,9 +610,6 @@ def render_agent_pipeline():
         "Validation Agent",
         "Output Agent",
     ]
-
-    if doc_type in ["invoice", "ticket"]:
-        pipeline.append("Concur Agent")
 
     status_map = {name: {"status": "pending", "message": ""} for name in pipeline}
 
@@ -754,12 +728,12 @@ def update_progress(percent, message):
 
 
 def get_suggested_questions(doc_type):
-    if doc_type == "invoice":
-        return ["What is the total amount?", "Who is the vendor?", "What is the invoice date?"]
     if doc_type == "resume":
-        return ["Summarize this candidate", "What skills does the candidate have?", "What is the experience?"]
-    if doc_type == "ticket":
-        return ["What is the ticket number?", "What is the travel date?", "What are the key details?"]
+        return [
+            "Summarize this candidate",
+            "What skills does the candidate have?",
+            "What is the experience?"
+        ]
     return ["What is this document?", "What are the key points?"]
 
 
@@ -773,12 +747,11 @@ def normalize_graph_result(result):
         }
 
     doc_type = result.get("doc_type") or result.get("type")
-    structured_data = result.get("data") if doc_type in ["invoice", "ticket"] else None
     inner = result.get("result", {}) if isinstance(result.get("result", {}), dict) else {}
 
     return {
         "doc_type": doc_type,
-        "structured_data": structured_data,
+        "structured_data": None,
         "result": inner,
         "error": result.get("error"),
         "step_metrics": result.get("step_metrics", []),
@@ -864,9 +837,8 @@ def process_single_file(uploaded_file):
 
     doc_type = normalized.get("doc_type")
     result = normalized.get("result", {})
-    review_data = result.get("data") or normalized.get("structured_data") or {}
+    review_data = result.get("data") or {}
 
-    # HARD FILTER: ONLY allow resumes
     if doc_type != "resume":
         record_agent_event(
             "Classification Agent",
@@ -896,14 +868,7 @@ def process_single_file(uploaded_file):
     confidence = normalized.get("confidence") or build_confidence_map(review_data, doc_type)
 
     if validation.get("passed", True):
-        if doc_type == "resume":
-            record_agent_event("Validation Agent", "done", "Resume validation complete")
-        elif doc_type == "invoice":
-            record_agent_event("Validation Agent", "done", "Invoice validation complete")
-        elif doc_type == "ticket":
-            record_agent_event("Validation Agent", "done", "Ticket validation complete")
-        else:
-            record_agent_event("Validation Agent", "done", "Validation complete")
+        record_agent_event("Validation Agent", "done", "Resume validation complete")
     else:
         record_agent_event("Validation Agent", "error", "Validation issues found")
 
@@ -928,7 +893,7 @@ def process_single_file(uploaded_file):
     st.session_state.duplicate_info = duplicate_info
     st.session_state.auto_result = {
         "doc_type": doc_type,
-        "structured_data": normalized.get("structured_data"),
+        "structured_data": None,
         "result": result,
         "metrics": {},
         "step_metrics": normalized.get("step_metrics", []),
@@ -1027,7 +992,7 @@ def go_to_next_batch_result():
         load_batch_result_into_session(next_index)
 
 
-def build_zip_from_batch_results(target_type: str) -> bytes:
+def build_zip_from_batch_results() -> bytes:
     output = BytesIO()
 
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1036,7 +1001,7 @@ def build_zip_from_batch_results(target_type: str) -> bytes:
             result = auto_result.get("result") or {}
             doc_type = item.get("doc_type")
 
-            if target_type == "resume" and doc_type == "resume":
+            if doc_type == "resume":
                 file_bytes = result.get("file")
                 file_name = result.get("file_name") or f"{item.get('file_name', 'resume')}.docx"
                 if file_bytes:
@@ -1044,31 +1009,12 @@ def build_zip_from_batch_results(target_type: str) -> bytes:
                         file_name = f"{file_name}.docx"
                     zf.writestr(file_name, file_bytes)
 
-            elif target_type == "invoice" and doc_type == "invoice":
-                excel_bytes = result.get("excel")
-                review_data = item.get("review_data") or {}
-                file_name = (
-                    review_data.get("invoice_number")
-                    or review_data.get("invoice_no")
-                    or review_data.get("vendor")
-                    or item.get("file_name")
-                    or "invoice_data"
-                )
-                file_name = str(file_name).strip()
-                file_name = re.sub(r'[\\/*?:"<>|]', "", file_name)
-
-                if excel_bytes:
-                    if not file_name.lower().endswith(".xlsx"):
-                        file_name = f"{file_name}.xlsx"
-                    zf.writestr(file_name, excel_bytes)
-
     output.seek(0)
     return output.getvalue()
 
 
-def get_batch_download_counts():
+def get_batch_download_count():
     resume_count = 0
-    invoice_count = 0
 
     for item in st.session_state.get("batch_results", []):
         auto_result = item.get("auto_result") or {}
@@ -1078,10 +1024,7 @@ def get_batch_download_counts():
         if doc_type == "resume" and result.get("file"):
             resume_count += 1
 
-        if doc_type == "invoice" and result.get("excel"):
-            invoice_count += 1
-
-    return resume_count, invoice_count
+    return resume_count
 
 
 def rank_all_resumes_against_jd():
@@ -1111,13 +1054,6 @@ def rank_all_resumes_against_jd():
         row["rank"] = idx
 
     st.session_state.jd_rankings = rankings
-
-
-def compact_field(label, value):
-    st.markdown(
-        f"**{label}**  \n<small>{value if value not in [None, ''] else '-'}</small>",
-        unsafe_allow_html=True
-    )
 
 
 # ------------------------------
@@ -1153,74 +1089,9 @@ def render_confidence_table():
 
 def refresh_review_scores():
     data = st.session_state.get("review_data") or {}
-    doc_type = st.session_state.get("doc_type") or "other"
+    doc_type = st.session_state.get("doc_type") or "resume"
     st.session_state.validation_result = validate_document_data(data, doc_type)
     st.session_state.confidence_map = build_confidence_map(data, doc_type)
-
-
-def render_invoice_review_form():
-    data = st.session_state.get("review_data") or {}
-    with st.form("invoice_review_form"):
-        c1, c2 = st.columns(2)
-        vendor = c1.text_input("Vendor", value=str(data.get("vendor") or data.get("supplier") or ""))
-        invoice_number = c2.text_input("Invoice Number", value=str(data.get("invoice_number") or data.get("invoice_no") or ""))
-        c3, c4 = st.columns(2)
-        invoice_date = c3.text_input("Invoice Date", value=str(data.get("invoice_date") or ""))
-        due_date = c4.text_input("Due Date", value=str(data.get("due_date") or ""))
-        c5, c6, c7, c8 = st.columns(4)
-        currency = c5.text_input("Currency", value=str(data.get("currency") or ""))
-        subtotal = c6.text_input("Subtotal", value=str(data.get("subtotal") or ""))
-        tax = c7.text_input("Tax", value=str(data.get("tax") or ""))
-        total = c8.text_input("Total", value=str(data.get("total") or ""))
-
-        saved = st.form_submit_button("Save Review Changes", use_container_width=True)
-
-    if saved:
-        data["vendor"] = vendor
-        data["invoice_number"] = invoice_number
-        data["invoice_date"] = invoice_date
-        data["due_date"] = due_date
-        data["currency"] = currency
-        data["subtotal"] = subtotal
-        data["tax"] = tax
-        data["total"] = total
-        st.session_state.review_data = data
-        refresh_review_scores()
-        st.success("Review updates saved")
-
-
-def render_ticket_review_form():
-    data = st.session_state.get("review_data") or {}
-    with st.form("ticket_review_form"):
-        c1, c2 = st.columns(2)
-        traveler_name = c1.text_input("Traveler Name", value=str(data.get("traveler_name") or ""))
-        ticket_number = c2.text_input("Ticket Number", value=str(data.get("ticket_number") or ""))
-        c3, c4 = st.columns(2)
-        airline = c3.text_input("Airline", value=str(data.get("airline") or ""))
-        booking_reference = c4.text_input("Booking Reference", value=str(data.get("booking_reference") or ""))
-        c5, c6 = st.columns(2)
-        from_city = c5.text_input("From", value=str(data.get("from") or ""))
-        to_city = c6.text_input("To", value=str(data.get("to") or ""))
-        c7, c8, c9 = st.columns(3)
-        departure_date = c7.text_input("Departure Date", value=str(data.get("departure_date") or ""))
-        return_date = c8.text_input("Return Date", value=str(data.get("return_date") or ""))
-        amount = c9.text_input("Amount", value=str(data.get("amount") or ""))
-
-        saved = st.form_submit_button("Save Review Changes", use_container_width=True)
-
-    if saved:
-        data["traveler_name"] = traveler_name
-        data["ticket_number"] = ticket_number
-        data["airline"] = airline
-        data["booking_reference"] = booking_reference
-        data["from"] = from_city
-        data["to"] = to_city
-        data["departure_date"] = departure_date
-        data["return_date"] = return_date
-        data["amount"] = amount
-        st.session_state.review_data = data
-        refresh_review_scores()
-        st.success("Review updates saved")
 
 
 def render_resume_review_form():
@@ -1233,7 +1104,10 @@ def render_resume_review_form():
         phone = c3.text_input("Phone", value=str(data.get("phone") or ""))
         location = c4.text_input("Location", value=str(data.get("location") or ""))
         linkedin = st.text_input("LinkedIn", value=str(data.get("linkedin") or ""))
-        skills = st.text_input("Skills (comma-separated)", value=", ".join(data.get("skills", [])) if isinstance(data.get("skills"), list) else "")
+        skills = st.text_input(
+            "Skills (comma-separated)",
+            value=", ".join(data.get("skills", [])) if isinstance(data.get("skills"), list) else ""
+        )
         summary = st.text_area("Summary", value=str(data.get("summary") or ""), height=120)
         saved = st.form_submit_button("Save Review Changes", use_container_width=True)
 
@@ -1248,40 +1122,6 @@ def render_resume_review_form():
         st.session_state.review_data = data
         refresh_review_scores()
         st.success("Review updates saved")
-
-
-def handle_invoice_or_ticket_submission(doc_type):
-    validation = st.session_state.get("validation_result") or {}
-    if not validation.get("passed"):
-        st.warning("Please resolve validation issues before approval")
-        return
-
-    data = st.session_state.get("review_data") or {}
-    result = send_to_concur(doc_type, data, mode="mock")
-    st.session_state.auto_result["result"].update({
-        "payload": result.get("payload"),
-        "concur_status": result.get("status"),
-        "concur_mode": result.get("mode"),
-        "concur_submission_id": result.get("submission_id"),
-        "concur_batch_id": result.get("batch_id"),
-        "concur_document_id": result.get("document_id"),
-        "concur_submitted_at": result.get("submitted_at"),
-        "concur_endpoint": result.get("endpoint"),
-        "concur_processing_state": result.get("processing_state"),
-        "concur_next_status": result.get("next_status"),
-        "message": result.get("message"),
-    })
-
-    save_version_snapshot(
-        file_name=st.session_state.get("current_file"),
-        doc_type=doc_type,
-        review_data=st.session_state.get("review_data"),
-        auto_result=st.session_state.get("auto_result"),
-        status="Submitted",
-        note=f"{doc_type.title()} submitted to Concur"
-    )
-
-    st.success(f"{doc_type.title()} approved and submitted to Concur")
 
 
 def regenerate_resume_from_review():
@@ -1526,16 +1366,9 @@ def render_sidebar_and_upload():
         if od_mode == "Drive ID + Folder Path":
             s1, s2 = st.columns(2)
             with s1:
-                drive_id = st.text_input(
-                    "OneDrive Drive ID",
-                    key="od_drive_id"
-                )
+                drive_id = st.text_input("OneDrive Drive ID", key="od_drive_id")
             with s2:
-                folder_path = st.text_input(
-                    "Folder Path",
-                    value="CVs",
-                    key="od_folder_path"
-                )
+                folder_path = st.text_input("Folder Path", value="CVs", key="od_folder_path")
 
             with c1:
                 if st.button("Load Resume CVs from OneDrive", use_container_width=True):
@@ -1628,104 +1461,7 @@ def render_result_workspace():
     total_results = len(st.session_state.get("batch_results", []))
     has_next = current_index < (total_results - 1)
 
-    if doc_type == "invoice":
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            compact_field("Vendor", str(data.get("vendor") or data.get("supplier") or "-"))
-        with c2:
-            compact_field("Invoice No", str(data.get("invoice_number") or data.get("invoice_no") or "-"))
-        with c3:
-            compact_field("Date", str(data.get("invoice_date") or "-"))
-        with c4:
-            compact_field("Total", str(data.get("total") or "-"))
-
-        if st.session_state.get("auto_result", {}).get("ocr_used"):
-            st.caption("OCR Applied")
-
-        render_validation_summary()
-        render_duplicate_warning()
-        render_confidence_table()
-
-        with st.expander("Review & Edit", expanded=True):
-            render_invoice_review_form()
-
-        b1, b2, b3, b4 = st.columns(4)
-        with b1:
-            if st.button("Approve & Send to Concur", use_container_width=True, key="invoice_send"):
-                handle_invoice_or_ticket_submission("invoice")
-
-        with b2:
-            excel = result.get("excel")
-            if excel:
-                st.download_button(
-                    "Download Excel",
-                    excel,
-                    f"{(data.get('invoice_number') or data.get('vendor') or 'invoice_data')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-
-        with b3:
-            json_bytes = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
-            json_name = f"{(data.get('invoice_number') or data.get('vendor') or 'invoice_data')}.json"
-            st.download_button(
-                "Download JSON",
-                json_bytes,
-                json_name,
-                mime="application/json",
-                use_container_width=True,
-                key="invoice_json_download"
-            )
-
-        with b4:
-            if st.button("Next Document", use_container_width=True, disabled=not has_next, key="invoice_next"):
-                go_to_next_batch_result()
-                st.rerun()
-
-    elif doc_type == "ticket":
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            compact_field("Traveler", str(data.get("traveler_name") or "-"))
-        with c2:
-            compact_field("Airline", str(data.get("airline") or "-"))
-        with c3:
-            compact_field("Route", f"{data.get('from', '-')}" + " → " + f"{data.get('to', '-')}")
-        with c4:
-            compact_field("Amount", str(data.get("amount") or "-"))
-
-        if st.session_state.get("auto_result", {}).get("ocr_used"):
-            st.caption("OCR Applied")
-
-        render_validation_summary()
-        render_duplicate_warning()
-        render_confidence_table()
-
-        with st.expander("Review & Edit", expanded=True):
-            render_ticket_review_form()
-
-        a1, a2, a3 = st.columns(3)
-        with a1:
-            if st.button("Approve & Send to Concur", use_container_width=True, key="ticket_send"):
-                handle_invoice_or_ticket_submission("ticket")
-
-        with a2:
-            json_bytes = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
-            json_name = f"{(data.get('ticket_number') or data.get('traveler_name') or 'ticket_data')}.json"
-            st.download_button(
-                "Download JSON",
-                json_bytes,
-                json_name,
-                mime="application/json",
-                use_container_width=True,
-                key="ticket_json_download"
-            )
-
-        with a3:
-            if st.button("Next Document", use_container_width=True, disabled=not has_next, key="ticket_next"):
-                go_to_next_batch_result()
-                st.rerun()
-
-    elif doc_type == "resume":
+    if doc_type == "resume":
         st.caption(f"Output File: {result.get('file_name', 'generated_resume.docx')}")
 
         r1, r2, r3 = st.columns(3)
@@ -1759,53 +1495,6 @@ def render_result_workspace():
         text = st.session_state.get("full_text", "")
         if text:
             st.text_area("Preview", value=text[:2500], height=180, label_visibility="collapsed")
-
-        g1, g2 = st.columns(2)
-
-        with g1:
-            if st.button("Chat with Document", use_container_width=True, key="generic_chat"):
-                st.session_state["open_doc_chat"] = True
-
-        with g2:
-            if st.button("Next Document", use_container_width=True, disabled=not has_next, key="generic_next"):
-                go_to_next_batch_result()
-                st.rerun()
-
-        if st.session_state.get("open_doc_chat"):
-            st.markdown("#### Document Chat")
-
-            user_q = st.text_input("Ask a question about this document", key="generic_doc_chat_q")
-
-            if st.button("Ask", use_container_width=True, key="generic_doc_chat_ask"):
-                full_text = st.session_state.get("full_text", "")
-                if not full_text.strip():
-                    st.warning("No document text available for chat.")
-                else:
-                    try:
-                        llm = get_llm(st.session_state.get("model_choice", "gpt-4o-mini"))
-                        prompt = f"""
-Answer the user's question using only the document text below.
-If the answer is not in the document, say so clearly.
-
-DOCUMENT TEXT:
-{full_text[:12000]}
-
-QUESTION:
-{user_q}
-"""
-                        answer = llm.invoke(prompt).content
-                        st.session_state.setdefault("generic_doc_chat_history", []).append({
-                            "question": user_q,
-                            "answer": answer,
-                        })
-                    except Exception as e:
-                        st.error(f"Chat failed: {str(e)}")
-
-            history = st.session_state.get("generic_doc_chat_history", [])
-            if history:
-                for item in reversed(history[-5:]):
-                    st.markdown(f"**Q:** {item['question']}")
-                    st.markdown(f"**A:** {item['answer']}")
 
 
 def render_batch_table():
@@ -1917,53 +1606,13 @@ def render_template_manager():
             st.write(", ".join(missing))
 
 
-def render_version_history():
-    st.markdown("### Version History")
-
-    history = st.session_state.get("version_history", [])
-    current_file = st.session_state.get("current_file")
-
-    if not history:
-        st.caption("No version history yet")
-        return
-
-    filtered = [h for h in history if h.get("file_name") == current_file] if current_file else history
-
-    if not filtered:
-        st.caption("No history for current document")
-        return
-
-    rows = []
-    for idx, item in enumerate(filtered):
-        rows.append({
-            "Version": idx + 1,
-            "Timestamp": item.get("timestamp"),
-            "Status": item.get("status"),
-            "Note": item.get("note"),
-        })
-
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=180)
-
-    selected = st.selectbox(
-        "Open version snapshot",
-        options=list(range(len(filtered))),
-        format_func=lambda i: f"Version {i+1} - {filtered[i]['timestamp']} - {filtered[i]['status']}",
-        key="version_history_selector"
-    )
-
-    if selected is not None:
-        snap = filtered[selected]
-        with st.expander("Snapshot Details", expanded=False):
-            st.json(snap.get("review_data", {}))
-
-
 def render_batch_downloads():
     st.markdown("### Batch Downloads")
 
-    resume_count, _ = get_batch_download_counts()
+    resume_count = get_batch_download_count()
 
     if resume_count > 0:
-        resume_zip = build_zip_from_batch_results("resume")
+        resume_zip = build_zip_from_batch_results()
         st.download_button(
             label=f"Download All Resumes ({resume_count})",
             data=resume_zip,
