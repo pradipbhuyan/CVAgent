@@ -1288,7 +1288,7 @@ def build_consolidated_assessment_pdf(report_data):
 
     story = []
 
-    story.append(Paragraph("Enhanced Candidate Screening Report", title_style))
+    story.append(Paragraph("Enhanced Candidate Screening Report for NTT Data India TMT Team", title_style))
     story.append(Paragraph(f"Analysis Date: {executive.get('analysis_date', '-')}", body_style))
     story.append(Paragraph("Confidential • Internal Recruiter Use Only", body_style))
     story.append(Spacer(1, 0.15 * inch))
