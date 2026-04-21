@@ -1204,230 +1204,53 @@ def render_sidebar_and_upload():
 
     st.markdown("### Document Source")
 
-    source_options = ["Local Upload", "SharePoint", "OneDrive"]
-    saved_source_mode = st.session_state.get("source_mode", "Local Upload")
-
-    if saved_source_mode not in source_options:
-        saved_source_mode = "Local Upload"
-        st.session_state["source_mode"] = "Local Upload"
-
+    # SharePoint and OneDrive remain in codebase but are disabled in UI
     source_mode = st.radio(
         "Choose source",
-        source_options,
+        ["Local Upload"],
         horizontal=True,
-        index=source_options.index(saved_source_mode),
+        index=0,
+        disabled=True,
+        help="SharePoint and OneDrive are currently disabled."
     )
 
-    st.session_state["source_mode"] = source_mode
+    st.session_state["source_mode"] = "Local Upload"
+    st.caption("SharePoint and OneDrive options are currently disabled.")
 
     uploaded_files = []
 
-    if source_mode == "Local Upload":
-        c1, c2 = st.columns([6, 1], gap="small")
+    c1, c2 = st.columns([6, 1], gap="small")
 
-        with c1:
-            uploaded_files = st.file_uploader(
-                f"Upload resume document(s) - max {MAX_BATCH_FILES} files per batch",
-                type=["txt", "pdf", "docx"],
-                accept_multiple_files=True,
-                key=f"main_file_uploader_{st.session_state.uploader_key}"
-            ) or []
+    with c1:
+        uploaded_files = st.file_uploader(
+            f"Upload resume document(s) - max {MAX_BATCH_FILES} files per batch",
+            type=["txt", "pdf", "docx"],
+            accept_multiple_files=True,
+            key=f"main_file_uploader_{st.session_state.uploader_key}"
+        ) or []
 
-        with c2:
-            st.write("")
-            st.write("")
-            if st.button("Reset", use_container_width=True):
-                st.session_state.batch_results = []
-                st.session_state.exception_queue = []
-                st.session_state.active_batch_index = 0
-                st.session_state.batch_processed = False
-                st.session_state.last_batch_signature = None
-                st.session_state.show_reprocess_confirm = False
-                st.session_state.pending_batch_signature = None
-                st.session_state.batch_total_files = 0
-                st.session_state.batch_processed_files = 0
-                st.session_state.batch_current_file = None
-                st.session_state.batch_file_statuses = []
-                st.session_state.jd_rankings = []
-                st.session_state.jd_text = ""
-                st.session_state.remote_uploaded_files = []
-                st.session_state.source_mode = "Local Upload"
-                st.session_state.uploader_key += 1
-                reset_run_state()
-                st.rerun()
-
-    elif source_mode == "SharePoint":
-        st.info("Load CVs from SharePoint using either site details or a folder URL.")
-        st.caption("Supported remote CV types: PDF, DOCX, TXT")
-
-        sp_mode = st.radio(
-            "SharePoint input mode",
-            ["Site + Library + Folder", "Folder URL"],
-            horizontal=True,
-            key="sp_input_mode"
-        )
-
-        c1, c2 = st.columns([6, 1], gap="small")
-
-        if sp_mode == "Site + Library + Folder":
-            s1, s2, s3 = st.columns(3)
-            with s1:
-                sharepoint_url = st.text_input(
-                    "SharePoint Site URL",
-                    placeholder="https://yourtenant.sharepoint.com/sites/Recruiting",
-                    key="sp_site_url"
-                )
-            with s2:
-                library_name = st.text_input(
-                    "Library Name",
-                    value="Documents",
-                    key="sp_library_name"
-                )
-            with s3:
-                folder_path = st.text_input(
-                    "Folder Path",
-                    value="CVs",
-                    key="sp_folder_path"
-                )
-
-            with c1:
-                if st.button("Load Resume CVs from SharePoint", use_container_width=True):
-                    if not sharepoint_url or not folder_path:
-                        st.warning("Please enter SharePoint Site URL and Folder Path.")
-                    else:
-                        try:
-                            with st.spinner("Loading CVs from SharePoint..."):
-                                fetched = get_cv_files_from_sharepoint(
-                                    site_url=sharepoint_url,
-                                    folder_path=folder_path,
-                                    library_name=library_name or "Documents",
-                                )
-                                remote_files = [
-                                    RemoteUploadedFile(name=f["name"], content=f["content"])
-                                    for f in fetched
-                                ]
-                                st.session_state["remote_uploaded_files"] = remote_files
-                                st.success(f"Loaded {len(remote_files)} CV file(s)")
-                        except Exception as e:
-                            st.error(f"Failed to load files: {str(e)}")
-        else:
-            folder_url = st.text_input(
-                "SharePoint Folder URL",
-                placeholder="Paste a SharePoint folder sharing URL",
-                key="sp_folder_url"
-            )
-
-            with c1:
-                if st.button("Load Resume CVs from SharePoint URL", use_container_width=True):
-                    if not folder_url:
-                        st.warning("Please paste a SharePoint folder URL.")
-                    else:
-                        try:
-                            with st.spinner("Loading CVs from SharePoint URL..."):
-                                fetched = get_cv_files_from_sharepoint_url(folder_url)
-                                remote_files = [
-                                    RemoteUploadedFile(name=f["name"], content=f["content"])
-                                    for f in fetched
-                                ]
-                                st.session_state["remote_uploaded_files"] = remote_files
-                                st.success(f"Loaded {len(remote_files)} CV file(s)")
-                        except Exception as e:
-                            st.error(f"Failed to load files: {str(e)}")
-
-        remote_files = st.session_state.get("remote_uploaded_files", [])
-        if remote_files:
-            st.caption(f"{len(remote_files)} CV file(s) ready from SharePoint")
-            st.write("Loaded files:")
-            for name in [f.name for f in remote_files[:10]]:
-                st.caption(f"• {name}")
-
-        with c2:
-            st.write("")
-            st.write("")
-            if st.button("Reset", use_container_width=True, key="reset_sharepoint_source"):
-                reset_source_state()
-                st.rerun()
-
-        uploaded_files = st.session_state.get("remote_uploaded_files", [])
-
-    else:
-        st.info("Load CVs from OneDrive using either drive details or a shared folder URL.")
-        st.caption("Supported remote CV types: PDF, DOCX, TXT")
-
-        od_mode = st.radio(
-            "OneDrive input mode",
-            ["Drive ID + Folder Path", "Shared Folder URL"],
-            horizontal=True,
-            key="od_input_mode"
-        )
-
-        c1, c2 = st.columns([6, 1], gap="small")
-
-        if od_mode == "Drive ID + Folder Path":
-            s1, s2 = st.columns(2)
-            with s1:
-                drive_id = st.text_input("OneDrive Drive ID", key="od_drive_id")
-            with s2:
-                folder_path = st.text_input("Folder Path", value="CVs", key="od_folder_path")
-
-            with c1:
-                if st.button("Load Resume CVs from OneDrive", use_container_width=True):
-                    if not drive_id or not folder_path:
-                        st.warning("Please enter OneDrive Drive ID and Folder Path.")
-                    else:
-                        try:
-                            with st.spinner("Loading CVs from OneDrive..."):
-                                fetched = get_cv_files_from_onedrive(
-                                    drive_id=drive_id,
-                                    folder_path=folder_path,
-                                )
-                                remote_files = [
-                                    RemoteUploadedFile(name=f["name"], content=f["content"])
-                                    for f in fetched
-                                ]
-                                st.session_state["remote_uploaded_files"] = remote_files
-                                st.success(f"Loaded {len(remote_files)} CV file(s)")
-                        except Exception as e:
-                            st.error(f"Failed to load files: {str(e)}")
-        else:
-            shared_url = st.text_input(
-                "OneDrive Shared Folder URL",
-                placeholder="Paste a OneDrive shared folder URL",
-                key="od_shared_url"
-            )
-
-            with c1:
-                if st.button("Load Resume CVs from OneDrive URL", use_container_width=True):
-                    if not shared_url:
-                        st.warning("Please paste a OneDrive shared folder URL.")
-                    else:
-                        try:
-                            with st.spinner("Loading CVs from OneDrive URL..."):
-                                fetched = get_cv_files_from_onedrive_url(shared_url)
-                                remote_files = [
-                                    RemoteUploadedFile(name=f["name"], content=f["content"])
-                                    for f in fetched
-                                ]
-                                st.session_state["remote_uploaded_files"] = remote_files
-                                st.success(f"Loaded {len(remote_files)} CV file(s)")
-                        except Exception as e:
-                            st.error(f"Failed to load files: {str(e)}")
-
-        remote_files = st.session_state.get("remote_uploaded_files", [])
-        if remote_files:
-            st.caption(f"{len(remote_files)} CV file(s) ready from OneDrive")
-            st.write("Loaded files:")
-            for name in [f.name for f in remote_files[:10]]:
-                st.caption(f"• {name}")
-
-        with c2:
-            st.write("")
-            st.write("")
-            if st.button("Reset", use_container_width=True, key="reset_onedrive_source"):
-                reset_source_state()
-                st.rerun()
-
-        uploaded_files = st.session_state.get("remote_uploaded_files", [])
+    with c2:
+        st.write("")
+        st.write("")
+        if st.button("Reset", use_container_width=True):
+            st.session_state.batch_results = []
+            st.session_state.exception_queue = []
+            st.session_state.active_batch_index = 0
+            st.session_state.batch_processed = False
+            st.session_state.last_batch_signature = None
+            st.session_state.show_reprocess_confirm = False
+            st.session_state.pending_batch_signature = None
+            st.session_state.batch_total_files = 0
+            st.session_state.batch_processed_files = 0
+            st.session_state.batch_current_file = None
+            st.session_state.batch_file_statuses = []
+            st.session_state.jd_rankings = []
+            st.session_state.jd_text = ""
+            st.session_state.remote_uploaded_files = []
+            st.session_state.source_mode = "Local Upload"
+            st.session_state.uploader_key += 1
+            reset_run_state()
+            st.rerun()
 
     if uploaded_files and len(uploaded_files) > MAX_BATCH_FILES:
         st.error(f"Batch limit exceeded. Maximum allowed is {MAX_BATCH_FILES} files.")
@@ -1435,6 +1258,7 @@ def render_sidebar_and_upload():
 
     st.markdown("---")
     return uploaded_files
+
 
 
 def render_duplicate_warning():
