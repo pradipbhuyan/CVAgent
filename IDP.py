@@ -69,7 +69,7 @@ class RemoteUploadedFile:
 # PAGE CONFIG
 # ------------------------------
 st.set_page_config(page_title="IDP - Professional", layout="wide")
-MAX_BATCH_FILES = 15
+MAX_BATCH_FILES = 20
 
 OPENAI_API_KEY = (
     st.secrets.get("OPENAI_API_KEY")
